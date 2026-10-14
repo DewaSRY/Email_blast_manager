@@ -1,5 +1,6 @@
 use std::{env, io, net::SocketAddr};
 
+#[derive(Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
 }
