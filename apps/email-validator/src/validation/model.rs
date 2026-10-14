@@ -7,6 +7,7 @@ pub enum EmailStatus {
     #[allow(dead_code)]
     Valid,
     Invalid,
+    #[allow(dead_code)]
     Risky,
     Unknown,
 }

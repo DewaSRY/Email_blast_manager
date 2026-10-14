@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let db = db::connect(&config.database_url).await?;
-    let app = app::create_app(config.clone(), db)?;
+    let app = app::create_app(db)?;
 
     let listener = TcpListener::bind(&config.bind_addr).await?;
     tracing::info!("Server listening on {}", listener.local_addr()?);

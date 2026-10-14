@@ -156,27 +156,8 @@ impl Stage for ClassifyStage {
         outcome.is_role = classification.is_role;
         outcome.is_free_provider = classification.is_free_provider;
         outcome.stage_reached = "classify".to_string();
-
-        if classification.is_disposable {
-            outcome.status = EmailStatus::Risky;
-            return StageOutcome::Finish(outcome.with_reason(
-                "DISPOSABLE",
-                "The address uses a known disposable email provider",
-            ));
-        }
-        if classification.is_role {
-            outcome.status = EmailStatus::Risky;
-            return StageOutcome::Finish(outcome.with_reason(
-                "ROLE_ACCOUNT",
-                "The address appears to be a role-based account",
-            ));
-        }
-
-        outcome.stage_reached = "smtp_probe".to_string();
-        StageOutcome::Finish(outcome.with_reason(
-            "SMTP_PROBE_NOT_CONFIGURED",
-            "Domain checks passed, but mailbox existence has not been verified",
-        ))
+        context.outcome = Some(outcome);
+        StageOutcome::Continue
     }
 }
 

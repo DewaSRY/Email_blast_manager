@@ -12,7 +12,7 @@ use crate::{
         file_validation::{MAX_UPLOAD_BYTES, read_upload},
     },
     import::{
-        dto::ImportEmailResponse,
+        dto::{ImportEmailResponse, ImportEmailForm},
         service::{import_file, invalid_rows_csv},
     },
 };
@@ -22,6 +22,7 @@ use crate::{
     path = "/import",
     tag = "Import",
     request_body(
+        content = ImportEmailForm,
         content_type = "multipart/form-data",
         description = "Multipart form with a `file` field (CSV, XLSX or XLS) that has an `email` column"
     ),
@@ -44,7 +45,7 @@ pub async fn import_emails(
 #[utoipa::path(
     get,
     path = "/import/{import_id}/invalid",
-    tag = "Import",
+    tag = "Import", 
     params(("import_id" = i64, Path, description = "Import id returned by the upload")),
     responses(
         (status = 200, description = "CSV of invalid rows", content_type = "text/csv"),

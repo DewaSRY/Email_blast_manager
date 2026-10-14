@@ -6,7 +6,7 @@ use csv::ReaderBuilder;
 
 use crate::common::AppError;
 
-pub const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_UPLOAD_BYTES: usize = 10* 10000 * 1024 * 1024;
 const EMAIL_HEADER: &str = "email";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,10 +112,11 @@ pub fn parse_sheet(file: &UploadedFile) -> Result<ParsedSheet, AppError> {
         .into_iter()
         .map(|header| header.trim().trim_start_matches('\u{feff}').to_string())
         .collect();
+
     let email_index = headers
         .iter()
         .position(|header| is_email_header(header))
-        .ok_or_else(|| AppError::bad_request("file", "File must have an `email` column"))?;
+        .ok_or_else(|| AppError::bad_request("file", &format!("File must have an `email` column. Found headers: {}", headers.join(",test "))))?;
 
     let width = headers.len();
     let rows = records
@@ -134,10 +135,29 @@ pub fn parse_sheet(file: &UploadedFile) -> Result<ParsedSheet, AppError> {
     })
 }
 
+fn detect_delimiter(bytes: &[u8]) -> u8 {
+    let first_line = bytes
+        .split(|&b| b == b'\n')
+        .next()
+        .unwrap_or_default();
+
+    let commas = first_line.iter().filter(|&&b| b == b',').count();
+    let semicolons = first_line.iter().filter(|&&b| b == b';').count();
+
+    if semicolons > commas {
+        b';'
+    } else {
+        b','
+    }
+}
+
 fn read_csv(bytes: &[u8]) -> Result<Vec<Vec<String>>, AppError> {
+    let delimiter = detect_delimiter(bytes);
+    
     ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
+        .delimiter(delimiter)
         .from_reader(bytes)
         .records()
         .map(|record| {

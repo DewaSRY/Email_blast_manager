@@ -7,7 +7,6 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
     common::{ApiResponse, AppError},
-    config::Config,
     health, import,
     validation::service::ValidationService,
     validator,
@@ -15,17 +14,15 @@ use crate::{
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Config,
     pub db: PgPool,
     pub validation_service: ValidationService,
 }
 
 impl AppState {
-    fn new(config: Config, db: PgPool) -> Result<Self, hickory_resolver::error::ResolveError> {
+    fn new(db: PgPool) -> Result<Self, hickory_resolver::error::ResolveError> {
         Ok(Self {
             db,
-            validation_service: ValidationService::system()?,
-            config,
+            validation_service: ValidationService::from_env()?,
         })
     }
 }
@@ -56,12 +53,11 @@ impl AppState {
 struct ApiDoc;
 
 pub fn create_app(
-    config: Config,
     db: PgPool,
 ) -> Result<Router, hickory_resolver::error::ResolveError> {
     info!("Initializing application state");
 
-    let state = AppState::new(config, db)?;
+    let state = AppState::new( db)?;
 
     info!("Application state initialized successfully");
 
