@@ -1,8 +1,5 @@
-use axum::{
-    http::StatusCode,
-    response::IntoResponse,
-    Router,
-};
+use axum::{Router, http::StatusCode, response::IntoResponse};
+use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use utoipa::OpenApi;
@@ -10,20 +7,23 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
     common::{ApiResponse, AppError},
+    config::Config,
     health, import,
     validation::service::ValidationService,
     validator,
-    config::Config,
 };
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
+    pub db: PgPool,
     pub validation_service: ValidationService,
 }
 
-impl AppState { fn new(config: Config) -> Result<Self, hickory_resolver::error::ResolveError> {
+impl AppState {
+    fn new(config: Config, db: PgPool) -> Result<Self, hickory_resolver::error::ResolveError> {
         Ok(Self {
+            db,
             validation_service: ValidationService::system()?,
             config,
         })
@@ -35,7 +35,8 @@ impl AppState { fn new(config: Config) -> Result<Self, hickory_resolver::error::
     paths(
         health::router::get_health,
         validator::router::validate_email,
-        import::router::import_emails
+        import::router::import_emails,
+        import::router::download_invalid
     ),
     components(schemas(
         health::dto::HealthResponse,
@@ -48,32 +49,32 @@ impl AppState { fn new(config: Config) -> Result<Self, hickory_resolver::error::
     )),
     tags(
         (name = "Health", description = "Health endpoints"),
-        (name = "Validator", description = "Validation endpoints")
+        (name = "Validator", description = "Validation endpoints"),
+        (name = "Import", description = "Import endpoints")
     )
 )]
 struct ApiDoc;
 
-pub fn create_app(config: Config) -> Result<Router, hickory_resolver::error::ResolveError> {
+pub fn create_app(
+    config: Config,
+    db: PgPool,
+) -> Result<Router, hickory_resolver::error::ResolveError> {
     info!("Initializing application state");
 
-    let state = AppState::new(config)?;
+    let state = AppState::new(config, db)?;
 
     info!("Application state initialized successfully");
 
-    Ok(
-        Router::<AppState>::new()
-            .nest("/health", health::router::router())
-            .nest("/validator/email", validator::router::router())
-            .nest("/validator/import", import::router::router())
-            .merge(
-                SwaggerUi::new("/swagger-ui")
-                    .url("/api-docs/openapi.json", ApiDoc::openapi()),
-            )
-            .fallback(not_found)
-            .method_not_allowed_fallback(method_not_allowed)
-            .layer(TraceLayer::new_for_http())
-            .with_state(state),
-    )
+    Ok(Router::<AppState>::new()
+        .nest("/health", health::router::router())
+        .nest("/validator/email", validator::router::router())
+        .nest("/import", import::router::router())
+        .route("/import/", axum::routing::post(import::router::import_emails))
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(TraceLayer::new_for_http())
+        .with_state(state))
 }
 
 async fn not_found() -> impl IntoResponse {

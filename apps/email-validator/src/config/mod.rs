@@ -3,6 +3,7 @@ use std::{env, io, net::SocketAddr};
 #[derive(Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
+    pub database_url: String,
 }
 
 impl Config {
@@ -20,6 +21,12 @@ impl Config {
             }
         };
 
-        Ok(Self { bind_addr })
+        let database_url = env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://user:password@localhost:5442/mydatabase".to_string());
+
+        Ok(Self {
+            bind_addr,
+            database_url,
+        })
     }
 }

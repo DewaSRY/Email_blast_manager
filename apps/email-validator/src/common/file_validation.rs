@@ -41,10 +41,13 @@ pub struct UploadedFile {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SheetStats {
-    pub total_rows: usize,
-    pub total_emails: usize,
+/// Header row plus data rows (fully blank rows dropped) of an uploaded sheet.
+#[derive(Debug)]
+pub struct ParsedSheet {
+    pub headers: Vec<String>,
+    pub email_index: usize,
+    /// `(1-based data row number, cells padded to the header width)`
+    pub rows: Vec<(usize, Vec<String>)>,
 }
 
 /// Reads the named multipart file field, enforcing the size limit while
@@ -95,44 +98,57 @@ pub async fn read_upload(
     Err(AppError::bad_request(field_name, "Missing file field"))
 }
 
-/// Counts data rows and rows with a non-empty email cell. The email column is
-/// the header named `email`, falling back to the first column.
-pub fn count_emails(file: &UploadedFile) -> Result<SheetStats, AppError> {
-    match file.format {
-        SheetFormat::Csv => count_csv(&file.bytes),
-        SheetFormat::Xlsx | SheetFormat::Xls => count_workbook(&file.bytes),
+/// Parses the file; the sheet must contain a header named `email`.
+pub fn parse_sheet(file: &UploadedFile) -> Result<ParsedSheet, AppError> {
+    let mut records = match file.format {
+        SheetFormat::Csv => read_csv(&file.bytes)?,
+        SheetFormat::Xlsx | SheetFormat::Xls => read_workbook(&file.bytes)?,
     }
-}
+    .into_iter();
 
-fn count_csv(bytes: &[u8]) -> Result<SheetStats, AppError> {
-    let mut reader = ReaderBuilder::new().flexible(true).from_reader(bytes);
-
-    let email_index = reader
-        .headers()
-        .map_err(|_| AppError::bad_request("file", "Invalid CSV headers"))?
+    let headers: Vec<String> = records
+        .next()
+        .ok_or_else(|| AppError::bad_request("file", "File has no header row"))?
+        .into_iter()
+        .map(|header| header.trim().trim_start_matches('\u{feff}').to_string())
+        .collect();
+    let email_index = headers
         .iter()
-        .position(is_email_header)
-        .unwrap_or(0);
+        .position(|header| is_email_header(header))
+        .ok_or_else(|| AppError::bad_request("file", "File must have an `email` column"))?;
 
-    let mut stats = SheetStats {
-        total_rows: 0,
-        total_emails: 0,
-    };
-    for record in reader.records() {
-        let record = record.map_err(|_| AppError::bad_request("file", "Invalid CSV row"))?;
-        stats.total_rows += 1;
-        if record
-            .get(email_index)
-            .is_some_and(|cell| !cell.trim().is_empty())
-        {
-            stats.total_emails += 1;
-        }
-    }
+    let width = headers.len();
+    let rows = records
+        .enumerate()
+        .filter(|(_, row)| row.iter().any(|cell| !cell.trim().is_empty()))
+        .map(|(index, mut row)| {
+            row.resize(width, String::new());
+            (index + 1, row)
+        })
+        .collect();
 
-    Ok(stats)
+    Ok(ParsedSheet {
+        headers,
+        email_index,
+        rows,
+    })
 }
 
-fn count_workbook(bytes: &[u8]) -> Result<SheetStats, AppError> {
+fn read_csv(bytes: &[u8]) -> Result<Vec<Vec<String>>, AppError> {
+    ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(bytes)
+        .records()
+        .map(|record| {
+            record
+                .map(|record| record.iter().map(str::to_string).collect())
+                .map_err(|_| AppError::bad_request("file", "Invalid CSV row"))
+        })
+        .collect()
+}
+
+fn read_workbook(bytes: &[u8]) -> Result<Vec<Vec<String>>, AppError> {
     let mut workbook = open_workbook_auto_from_rs(Cursor::new(bytes))
         .map_err(|_| AppError::bad_request("file", "Invalid Excel file"))?;
     let range = workbook
@@ -140,40 +156,22 @@ fn count_workbook(bytes: &[u8]) -> Result<SheetStats, AppError> {
         .ok_or_else(|| AppError::bad_request("file", "Workbook has no worksheets"))?
         .map_err(|_| AppError::bad_request("file", "Could not read worksheet"))?;
 
-    let mut rows = range.rows();
-    let email_index = rows
-        .next()
-        .and_then(|header| {
-            header
-                .iter()
-                .position(|cell| is_email_header(&cell.to_string()))
-        })
-        .unwrap_or(0);
-
-    let mut stats = SheetStats {
-        total_rows: 0,
-        total_emails: 0,
-    };
-    for row in rows {
-        stats.total_rows += 1;
-        if row
-            .get(email_index)
-            .is_some_and(|cell| !cell.to_string().trim().is_empty())
-        {
-            stats.total_emails += 1;
-        }
-    }
-
-    Ok(stats)
+    Ok(range
+        .rows()
+        .map(|row| row.iter().map(|cell| cell.to_string()).collect())
+        .collect())
 }
 
 fn is_email_header(header: &str) -> bool {
-    header.trim().eq_ignore_ascii_case(EMAIL_HEADER)
+    header
+        .trim()
+        .trim_start_matches('\u{feff}')
+        .eq_ignore_ascii_case(EMAIL_HEADER)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SheetFormat, SheetStats, UploadedFile, count_emails};
+    use super::{SheetFormat, UploadedFile, parse_sheet};
 
     fn csv(content: &str) -> UploadedFile {
         UploadedFile {
@@ -202,24 +200,19 @@ mod tests {
     }
 
     #[test]
-    fn counts_rows_using_the_email_header() {
-        let stats =
-            count_emails(&csv("name,Email\nA,a@example.com\nB,\nC,c@example.com\n")).unwrap();
+    fn parses_rows_using_the_email_header() {
+        let sheet =
+            parse_sheet(&csv("name,Email\nA,a@example.com\n,\nC,c@example.com\nD\n")).unwrap();
 
-        assert_eq!(
-            stats,
-            SheetStats {
-                total_rows: 3,
-                total_emails: 2
-            }
-        );
+        assert_eq!(sheet.email_index, 1);
+        assert_eq!(sheet.rows.len(), 3);
+        assert_eq!(sheet.rows[1].0, 3);
+        assert_eq!(sheet.rows[2].1, vec!["D".to_string(), String::new()]);
     }
 
     #[test]
-    fn falls_back_to_first_column_without_email_header() {
-        let stats = count_emails(&csv("address\na@example.com\n\n")).unwrap();
-
-        assert_eq!(stats.total_emails, 1);
+    fn rejects_files_without_email_header() {
+        assert!(parse_sheet(&csv("address\na@example.com\n")).is_err());
     }
 
     #[test]
@@ -230,6 +223,6 @@ mod tests {
             bytes: b"not a workbook".to_vec(),
         };
 
-        assert!(count_emails(&file).is_err());
+        assert!(parse_sheet(&file).is_err());
     }
 }
