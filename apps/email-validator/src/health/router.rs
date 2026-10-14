@@ -1,9 +1,9 @@
-use axum::{routing::get, Json, Router};
-use utoipa::path;
+use axum::{Json, Router, routing::get};
 
-use crate::health::{
-    dto::HealthResponse,
-    model::HealthStatus,
+use crate::{
+    app::AppState,
+    common::ApiResponse,
+    health::{dto::HealthResponse, model::HealthStatus},
 };
 
 #[utoipa::path(
@@ -11,14 +11,14 @@ use crate::health::{
     path = "/health",
     tag = "Health",
     responses(
-        (status = 200, description = "Service health", body = HealthResponse)
+        (status = 200, description = "Service health", body = ApiResponse<HealthResponse>)
     )
 )]
-async fn get_health() -> Json<HealthResponse> {
+async fn get_health() -> Json<ApiResponse<HealthResponse>> {
     let model = HealthStatus::new();
-    Json(HealthResponse::from(model))
+    Json(ApiResponse::ok(HealthResponse::from(model), "OK"))
 }
 
-pub fn router() -> Router {
+pub fn router() -> Router<AppState> {
     Router::new().route("/", get(get_health))
 }

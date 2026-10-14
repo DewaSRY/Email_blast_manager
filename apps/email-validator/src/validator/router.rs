@@ -1,27 +1,37 @@
-use axum::{routing::post, Json, Router};
-use utoipa::path;
+use axum::{
+    Json, Router,
+    extract::{State, rejection::JsonRejection},
+    http::StatusCode,
+    routing::post,
+};
 
-use crate::validator::{
-    dto::{ValidateEmailRequest, ValidateEmailResponse},
-    model::EmailValidation,
+use crate::{
+    app::AppState,
+    common::{ApiResponse, AppError},
+    validator::dto::{ValidateEmailRequest, ValidateEmailResponse},
 };
 
 #[utoipa::path(
     post,
-    path = "/",
+    path = "/validator/email",
     tag = "Validator",
     request_body = ValidateEmailRequest,
     responses(
-        (status = 200, description = "Email validation result", body = ValidateEmailResponse)
+        (status = 200, description = "Email validation result", body = ApiResponse<ValidateEmailResponse>),
+        (status = 400, description = "Malformed request", body = ApiResponse<crate::common::ApiErrorPayload>)
     )
 )]
 async fn validate_email(
-    Json(request): Json<ValidateEmailRequest>,
-) -> Json<ValidateEmailResponse> {
-    let model = EmailValidation::new(request.email);
-    Json(ValidateEmailResponse::from(model))
+    State(state): State<AppState>,
+    payload: Result<Json<ValidateEmailRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ValidateEmailResponse>>, AppError> {
+    let Json(request) =
+        payload.map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "Invalid request body"))?;
+    let outcome = state.validation_service.validate(&request.email).await;
+
+    Ok(Json(ApiResponse::ok(outcome, "OK")))
 }
 
-pub fn router() -> Router {
+pub fn router() -> Router<AppState> {
     Router::new().route("/", post(validate_email))
 }
