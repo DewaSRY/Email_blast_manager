@@ -1,7 +1,7 @@
 use axum::{
     http::StatusCode,
     response::IntoResponse,
-    Json, Router,
+    Router,
 };
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -9,7 +9,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
-    common::ApiResponse,
+    common::{ApiResponse, AppError},
     health,
     validation::service::ValidationService,
     validator,
@@ -22,8 +22,7 @@ pub struct AppState {
     pub validation_service: ValidationService,
 }
 
-impl AppState {
-    fn new(config: Config) -> Result<Self, hickory_resolver::error::ResolveError> {
+impl AppState { fn new(config: Config) -> Result<Self, hickory_resolver::error::ResolveError> {
         Ok(Self {
             validation_service: ValidationService::system()?,
             config,
@@ -78,14 +77,7 @@ async fn not_found() -> impl IntoResponse {
 
     tracing::warn!(status = %status, "Route not found");
 
-    (
-        status,
-        Json(ApiResponse::<String>::with_status(
-            None,
-            status,
-            "Not found",
-        )),
-    )
+    AppError::new(status, "Not found").into_response()
 }
 
 async fn method_not_allowed() -> impl IntoResponse {
@@ -93,12 +85,5 @@ async fn method_not_allowed() -> impl IntoResponse {
 
     tracing::warn!(status = %status, "Method not allowed");
 
-    (
-        status,
-        Json(ApiResponse::<String>::with_status(
-            None,
-            status,
-            "Method not allowed",
-        )),
-    )
+    AppError::new(status, "Method not allowed").into_response()
 }

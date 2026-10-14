@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use email_address::EmailAddress;
 use idna::domain_to_ascii;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::validation::model::{EmailStatus, ValidationOutcome};
 
@@ -64,13 +65,14 @@ pub fn normalize_and_validate_email(input: &str) -> Result<NormalizedEmail, &'st
         return Err("Email must contain a local part and domain");
     };
 
-    if local_part.is_empty() || domain.is_empty() || local_part.len() > 64 {
+    let normalized_local_part = local_part.nfc().collect::<String>();
+    if normalized_local_part.is_empty() || domain.is_empty() || normalized_local_part.len() > 64 {
         return Err("Email local part or domain has an invalid length");
     }
 
     let domain = domain_to_ascii(domain).map_err(|_| "Email domain is not a valid IDN")?;
     let normalized_domain = domain.to_ascii_lowercase();
-    let normalized_email = format!("{local_part}@{normalized_domain}");
+    let normalized_email = format!("{normalized_local_part}@{normalized_domain}");
 
     if normalized_email.len() > 254 || !EmailAddress::is_valid(&normalized_email) {
         return Err("Email address syntax is invalid");
@@ -78,7 +80,7 @@ pub fn normalize_and_validate_email(input: &str) -> Result<NormalizedEmail, &'st
 
     Ok(NormalizedEmail {
         value: normalized_email,
-        local_part: local_part.to_string(),
+        local_part: normalized_local_part,
         domain: normalized_domain,
     })
 }
@@ -189,6 +191,14 @@ mod tests {
         assert_eq!(email.value, "Person@xn--bcher-kva.de");
         assert_eq!(email.local_part, "Person");
         assert_eq!(email.domain, "xn--bcher-kva.de");
+    }
+
+    #[test]
+    fn normalizes_local_part_to_unicode_nfc() {
+        let email = normalize_and_validate_email("e\u{301}@example.com").unwrap();
+
+        assert_eq!(email.value, "é@example.com");
+        assert_eq!(email.local_part, "é");
     }
 
     #[test]

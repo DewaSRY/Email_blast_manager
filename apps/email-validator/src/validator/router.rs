@@ -1,7 +1,6 @@
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
-    http::StatusCode,
     routing::post,
 };
 
@@ -26,7 +25,7 @@ async fn validate_email(
     payload: Result<Json<ValidateEmailRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ValidateEmailResponse>>, AppError> {
     let Json(request) =
-        payload.map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "Invalid request body"))?;
+        payload.map_err(|_| AppError::bad_request("body", "Malformed or invalid request body"))?;
     let outcome = state.validation_service.validate(&request.email).await;
 
     Ok(Json(ApiResponse::ok(outcome, "OK")))

@@ -95,6 +95,17 @@ impl AppError {
         }
     }
 
+    pub fn bad_request(field: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: "Invalid request body".to_string(),
+            field_errors: vec![ApiErrorItem {
+                field: field.into(),
+                reason: reason.into(),
+            }],
+        }
+    }
+
     #[allow(dead_code)]
     pub fn validation_error(field: impl Into<String>, reason: impl Into<String>) -> Self {
         Self {
@@ -111,13 +122,9 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let payload = ApiResponse::with_status(
-            if self.field_errors.is_empty() {
-                None
-            } else {
-                Some(ApiErrorPayload {
-                    errors: self.field_errors,
-                })
-            },
+            Some(ApiErrorPayload {
+                errors: self.field_errors,
+            }),
             self.status,
             self.message,
         );
@@ -128,9 +135,13 @@ impl IntoResponse for AppError {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
+    use axum::{
+        body::to_bytes,
+        http::{StatusCode, header},
+        response::IntoResponse,
+    };
 
-    use super::{ApiErrorPayload, ApiResponse, AppError};
+    use super::{ApiResponse, AppError};
 
     #[test]
     fn success_response_uses_the_documented_envelope() {
@@ -142,21 +153,40 @@ mod tests {
         assert_eq!(value["code"], 200);
     }
 
-    #[test]
-    fn error_response_contains_field_details_inside_data() {
+    #[tokio::test]
+    async fn error_response_contains_field_details_inside_data() {
         let error = AppError::validation_error("email", "invalid format");
-        let response = ApiResponse::with_status(
-            Some(ApiErrorPayload {
-                errors: error.field_errors,
-            }),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Validation failed",
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
         );
-        let value = serde_json::to_value(response).unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(value["data"]["errors"][0]["field"], "email");
         assert_eq!(value["data"]["errors"][0]["reason"], "invalid format");
         assert_eq!(value["code"], 422);
+    }
+
+    #[tokio::test]
+    async fn general_error_response_keeps_an_empty_errors_array() {
+        let response = AppError::new(StatusCode::NOT_FOUND, "Not found").into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["data"]["errors"], serde_json::json!([]));
+        assert_eq!(value["message"], "Not found");
+        assert_eq!(value["code"], 404);
+    }
+
+    #[test]
+    fn malformed_request_error_uses_bad_request_status() {
+        let response = AppError::bad_request("body", "Malformed JSON").into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
