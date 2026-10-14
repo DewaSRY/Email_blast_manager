@@ -1,5 +1,0 @@
-.env
-**/node_modules/
-**/.next/
-**/target/
-.DS_Store
