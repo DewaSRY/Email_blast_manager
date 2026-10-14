@@ -1,3 +1,5 @@
+pub mod file_validation;
+
 use axum::{
     Json,
     http::StatusCode,

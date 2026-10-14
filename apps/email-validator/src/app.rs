@@ -10,7 +10,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
     common::{ApiResponse, AppError},
-    health,
+    health, import,
     validation::service::ValidationService,
     validator,
     config::Config,
@@ -34,14 +34,17 @@ impl AppState { fn new(config: Config) -> Result<Self, hickory_resolver::error::
 #[openapi(
     paths(
         health::router::get_health,
-        validator::router::validate_email
+        validator::router::validate_email,
+        import::router::import_emails
     ),
     components(schemas(
         health::dto::HealthResponse,
         validator::dto::ValidateEmailRequest,
         validator::dto::ValidateEmailResponse,
         ApiResponse<health::dto::HealthResponse>,
-        ApiResponse<validator::dto::ValidateEmailResponse>
+        ApiResponse<validator::dto::ValidateEmailResponse>,
+        import::dto::ImportEmailResponse,
+        ApiResponse<import::dto::ImportEmailResponse>
     )),
     tags(
         (name = "Health", description = "Health endpoints"),
@@ -61,6 +64,7 @@ pub fn create_app(config: Config) -> Result<Router, hickory_resolver::error::Res
         Router::<AppState>::new()
             .nest("/health", health::router::router())
             .nest("/validator/email", validator::router::router())
+            .nest("/validator/import", import::router::router())
             .merge(
                 SwaggerUi::new("/swagger-ui")
                     .url("/api-docs/openapi.json", ApiDoc::openapi()),
