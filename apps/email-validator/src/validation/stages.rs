@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use email_address::EmailAddress;
 use idna::domain_to_ascii;
+use tracing::{debug, warn};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::validation::model::{EmailStatus, ValidationOutcome};
@@ -28,6 +29,8 @@ pub enum StageOutcome {
 
 #[async_trait]
 pub trait Stage: Send + Sync {
+    fn name(&self) -> &'static str;
+
     async fn run(&self, context: &mut ValidationContext) -> StageOutcome;
 }
 
@@ -35,20 +38,28 @@ pub struct SyntaxStage;
 
 #[async_trait]
 impl Stage for SyntaxStage {
+    fn name(&self) -> &'static str {
+        "syntax"
+    }
+
     async fn run(&self, context: &mut ValidationContext) -> StageOutcome {
         match normalize_and_validate_email(&context.input) {
             Ok(email) => {
+                debug!(domain = %email.domain, "Syntax check passed");
                 context.normalized = Some(email);
                 StageOutcome::Continue
             }
-            Err(reason) => StageOutcome::Finish(
-                ValidationOutcome::new(
-                    context.input.trim().to_string(),
-                    EmailStatus::Invalid,
-                    "syntax",
+            Err(reason) => {
+                debug!(reason, "Syntax check failed");
+                StageOutcome::Finish(
+                    ValidationOutcome::new(
+                        context.input.trim().to_string(),
+                        EmailStatus::Invalid,
+                        "syntax",
+                    )
+                    .with_reason("INVALID_SYNTAX", reason),
                 )
-                .with_reason("INVALID_SYNTAX", reason),
-            ),
+            }
         }
     }
 }
@@ -134,10 +145,15 @@ pub struct ClassifyStage;
 
 #[async_trait]
 impl Stage for ClassifyStage {
+    fn name(&self) -> &'static str {
+        "classify"
+    }
+
     async fn run(&self, context: &mut ValidationContext) -> StageOutcome {
         let (Some(email), Some(mut outcome)) =
             (context.normalized.as_ref(), context.outcome.take())
         else {
+            warn!("Classify stage ran without normalized email or domain outcome");
             return StageOutcome::Finish(
                 ValidationOutcome::new(
                     context.input.trim().to_string(),
@@ -156,6 +172,13 @@ impl Stage for ClassifyStage {
         outcome.is_role = classification.is_role;
         outcome.is_free_provider = classification.is_free_provider;
         outcome.stage_reached = "classify".to_string();
+        debug!(
+            domain = %email.domain,
+            is_disposable = classification.is_disposable,
+            is_role = classification.is_role,
+            is_free_provider = classification.is_free_provider,
+            "Classification flags recorded"
+        );
         context.outcome = Some(outcome);
         StageOutcome::Continue
     }

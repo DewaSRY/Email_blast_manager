@@ -1,4 +1,8 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
@@ -8,6 +12,7 @@ use tokio::{
     net::TcpStream,
     time::timeout,
 };
+use tracing::{debug, info, warn};
 
 use crate::validation::{
     model::{EmailStatus, ValidationOutcome},
@@ -85,6 +90,22 @@ impl TcpSmtpProber {
             }
             _ => SmtpIdentity::Invalid,
         };
+        match &identity {
+            SmtpIdentity::Configured {
+                ehlo_host,
+                mail_from,
+            } => {
+                let sender_domain = mail_from.rsplit_once('@').map_or("", |(_, domain)| domain);
+                info!(%ehlo_host, %sender_domain, "SMTP probing enabled");
+            }
+            SmtpIdentity::Missing => warn!(
+                "SMTP probing disabled: SMTP_EHLO_HOST and SMTP_MAIL_FROM are not set; \
+                 deliverable addresses will stay unknown"
+            ),
+            SmtpIdentity::Invalid => warn!(
+                "SMTP probing disabled: SMTP_EHLO_HOST or SMTP_MAIL_FROM is invalid or only one is set"
+            ),
+        }
         Self { identity }
     }
 
@@ -101,14 +122,21 @@ impl TcpSmtpProber {
         )
         .await
         {
-            Err(_) => SmtpProbeResult::Indeterminate {
-                reason_code: "SMTP_TIMEOUT".to_string(),
-                detail: "The mail server did not respond before the probe timed out".to_string(),
-            },
-            Ok(Err(error)) => SmtpProbeResult::Indeterminate {
-                reason_code: "SMTP_CONNECTION_FAILED".to_string(),
-                detail: format!("Could not complete the SMTP probe: {error}"),
-            },
+            Err(_) => {
+                warn!(%mx_host, timeout_secs = 10, "SMTP probe timed out");
+                SmtpProbeResult::Indeterminate {
+                    reason_code: "SMTP_TIMEOUT".to_string(),
+                    detail: "The mail server did not respond before the probe timed out"
+                        .to_string(),
+                }
+            }
+            Ok(Err(error)) => {
+                warn!(%mx_host, %error, "SMTP probe connection failed");
+                SmtpProbeResult::Indeterminate {
+                    reason_code: "SMTP_CONNECTION_FAILED".to_string(),
+                    detail: format!("Could not complete the SMTP probe: {error}"),
+                }
+            }
             Ok(Ok(SmtpReply {
                 code: 200..=299,
                 response,
@@ -119,15 +147,22 @@ impl TcpSmtpProber {
                 response,
                 is_recipient_reply: true,
             })) => SmtpProbeResult::Rejected { code, response },
-            Ok(Ok(SmtpReply { code, response, .. })) => SmtpProbeResult::Indeterminate {
-                reason_code: if (400..500).contains(&code) {
-                    "SMTP_TEMPORARY_FAILURE"
-                } else {
-                    "SMTP_SERVER_REJECTED"
+            Ok(Ok(SmtpReply {
+                code,
+                response,
+                is_recipient_reply,
+            })) => {
+                warn!(%mx_host, code, is_recipient_reply, %response, "SMTP probe was inconclusive");
+                SmtpProbeResult::Indeterminate {
+                    reason_code: if (400..500).contains(&code) {
+                        "SMTP_TEMPORARY_FAILURE"
+                    } else {
+                        "SMTP_SERVER_REJECTED"
+                    }
+                    .to_string(),
+                    detail: format!("SMTP server replied {code}: {response}"),
                 }
-                .to_string(),
-                detail: format!("SMTP server replied {code}: {response}"),
-            },
+            }
         }
     }
 }
@@ -141,6 +176,7 @@ impl SmtpProber for TcpSmtpProber {
                 mail_from,
             } => {
                 if !recipient.is_ascii() {
+                    debug!(%mx_host, "Skipping SMTP probe: internationalized mailbox name");
                     return SmtpProbeResult::Indeterminate {
                         reason_code: "SMTPUTF8_NOT_SUPPORTED".to_string(),
                         detail:
@@ -151,15 +187,22 @@ impl SmtpProber for TcpSmtpProber {
                 self.probe_configured(mx_host, recipient, ehlo_host, mail_from)
                     .await
             }
-            SmtpIdentity::Missing => SmtpProbeResult::Indeterminate {
-                reason_code: "SMTP_PROBE_NOT_CONFIGURED".to_string(),
-                detail: "Set SMTP_EHLO_HOST and SMTP_MAIL_FROM to enable mailbox probing"
-                    .to_string(),
-            },
-            SmtpIdentity::Invalid => SmtpProbeResult::Indeterminate {
-                reason_code: "SMTP_IDENTITY_INVALID".to_string(),
-                detail: "SMTP_EHLO_HOST or SMTP_MAIL_FROM is not a valid SMTP identity".to_string(),
-            },
+            SmtpIdentity::Missing => {
+                debug!(%mx_host, "Skipping SMTP probe: identity not configured");
+                SmtpProbeResult::Indeterminate {
+                    reason_code: "SMTP_PROBE_NOT_CONFIGURED".to_string(),
+                    detail: "Set SMTP_EHLO_HOST and SMTP_MAIL_FROM to enable mailbox probing"
+                        .to_string(),
+                }
+            }
+            SmtpIdentity::Invalid => {
+                debug!(%mx_host, "Skipping SMTP probe: identity invalid");
+                SmtpProbeResult::Indeterminate {
+                    reason_code: "SMTP_IDENTITY_INVALID".to_string(),
+                    detail: "SMTP_EHLO_HOST or SMTP_MAIL_FROM is not a valid SMTP identity"
+                        .to_string(),
+                }
+            }
         }
     }
 }
@@ -202,10 +245,18 @@ async fn smtp_recipient_probe_at(
     ehlo_host: &str,
     mail_from: &str,
 ) -> io::Result<SmtpReply> {
+    let connect_started = Instant::now();
     let stream = TcpStream::connect((mx_host, port)).await?;
+    debug!(
+        %mx_host,
+        port,
+        elapsed_ms = connect_started.elapsed().as_millis() as u64,
+        "SMTP connection established"
+    );
     let mut stream = BufReader::new(stream);
 
     let (code, response) = read_smtp_response(&mut stream).await?;
+    debug!(%mx_host, code, step = "greeting", "SMTP reply");
     if code != 220 {
         return Ok(SmtpReply {
             code,
@@ -215,6 +266,7 @@ async fn smtp_recipient_probe_at(
     }
 
     let (code, response) = smtp_command(&mut stream, &format!("EHLO {ehlo_host}")).await?;
+    debug!(%mx_host, code, step = "ehlo", "SMTP reply");
     if code != 250 {
         return Ok(SmtpReply {
             code,
@@ -224,6 +276,7 @@ async fn smtp_recipient_probe_at(
     }
 
     let (code, response) = smtp_command(&mut stream, &format!("MAIL FROM:<{mail_from}>")).await?;
+    debug!(%mx_host, code, step = "mail_from", "SMTP reply");
     if code != 250 {
         return Ok(SmtpReply {
             code,
@@ -233,6 +286,7 @@ async fn smtp_recipient_probe_at(
     }
 
     let (code, response) = smtp_command(&mut stream, &format!("RCPT TO:<{recipient}>")).await?;
+    debug!(%mx_host, code, step = "rcpt_to", "SMTP reply");
     let _ = stream.get_mut().write_all(b"QUIT\r\n").await;
     Ok(SmtpReply {
         code,
@@ -345,8 +399,13 @@ impl DnsResolver for SystemDnsResolver {
                 }
             }
             Err(error) if is_nx_domain(error.kind()) => return Ok(DomainLookup::NotFound),
-            Err(error) if is_no_records(error.kind()) => {}
-            Err(_) => return Err(DnsLookupError::Temporary),
+            Err(error) if is_no_records(error.kind()) => {
+                debug!(%domain, "No MX records, trying A/AAAA fallback");
+            }
+            Err(error) => {
+                warn!(%domain, %error, "MX lookup failed");
+                return Err(DnsLookupError::Temporary);
+            }
         }
 
         match self.resolver.lookup_ip(&fully_qualified_domain).await {
@@ -354,7 +413,10 @@ impl DnsResolver for SystemDnsResolver {
             Ok(_) => Ok(DomainLookup::NoMx),
             Err(error) if is_nx_domain(error.kind()) => Ok(DomainLookup::NotFound),
             Err(error) if is_no_records(error.kind()) => Ok(DomainLookup::NoMx),
-            Err(_) => Err(DnsLookupError::Temporary),
+            Err(error) => {
+                warn!(%domain, %error, "Address fallback lookup failed");
+                Err(DnsLookupError::Temporary)
+            }
         }
     }
 }
@@ -385,6 +447,10 @@ struct DomainStage {
 
 #[async_trait]
 impl Stage for DomainStage {
+    fn name(&self) -> &'static str {
+        "domain"
+    }
+
     async fn run(&self, context: &mut ValidationContext) -> StageOutcome {
         let Some(email) = context.normalized.as_ref() else {
             return StageOutcome::Finish(
@@ -400,7 +466,23 @@ impl Stage for DomainStage {
         let mut outcome =
             ValidationOutcome::new(email.value.clone(), EmailStatus::Unknown, "domain");
 
-        match self.dns.lookup_domain(&email.domain).await {
+        let lookup_started = Instant::now();
+        let lookup = self.dns.lookup_domain(&email.domain).await;
+        debug!(
+            domain = %email.domain,
+            lookup_ms = lookup_started.elapsed().as_millis() as u64,
+            result = match &lookup {
+                Ok(DomainLookup::Mx(records)) => format!("mx({})", records.len()),
+                Ok(DomainLookup::AddressFallback) => "address_fallback".to_string(),
+                Ok(DomainLookup::NullMx) => "null_mx".to_string(),
+                Ok(DomainLookup::NoMx) => "no_mx".to_string(),
+                Ok(DomainLookup::NotFound) => "nxdomain".to_string(),
+                Err(_) => "temporary_failure".to_string(),
+            },
+            "DNS lookup finished"
+        );
+
+        match lookup {
             Ok(DomainLookup::NotFound) => {
                 outcome.status = EmailStatus::Invalid;
                 return StageOutcome::Finish(
@@ -438,6 +520,10 @@ struct SmtpProbeStage {
 
 #[async_trait]
 impl Stage for SmtpProbeStage {
+    fn name(&self) -> &'static str {
+        "smtp_probe"
+    }
+
     async fn run(&self, context: &mut ValidationContext) -> StageOutcome {
         let (Some(email), Some(mut outcome)) =
             (context.normalized.as_ref(), context.outcome.take())
@@ -456,9 +542,13 @@ impl Stage for SmtpProbeStage {
         };
 
         outcome.stage_reached = "smtp_probe".to_string();
-        for mx_host in &outcome.mx_hosts {
+        let domain = email.domain.as_str();
+        let total_hosts = outcome.mx_hosts.len();
+        for (index, mx_host) in outcome.mx_hosts.iter().enumerate() {
+            debug!(%domain, %mx_host, attempt = index + 1, total_hosts, "Probing mail server");
             match self.prober.probe(mx_host, &email.value).await {
                 SmtpProbeResult::Accepted { response } => {
+                    info!(%domain, %mx_host, "Mail server accepted recipient");
                     outcome.status = EmailStatus::Valid;
                     return StageOutcome::Finish(outcome.with_reason(
                         "SMTP_ACCEPTED",
@@ -468,6 +558,7 @@ impl Stage for SmtpProbeStage {
                     ));
                 }
                 SmtpProbeResult::Rejected { code, response } => {
+                    info!(%domain, %mx_host, code, "Mail server rejected recipient");
                     outcome.status = EmailStatus::Invalid;
                     return StageOutcome::Finish(outcome.with_reason(
                         "SMTP_RECIPIENT_REJECTED",
@@ -478,6 +569,7 @@ impl Stage for SmtpProbeStage {
                     reason_code,
                     detail,
                 } => {
+                    debug!(%domain, %mx_host, %reason_code, "Probe inconclusive, trying next host");
                     outcome.reason_code = Some(reason_code);
                     outcome.reason_detail = Some(detail);
                 }
@@ -530,14 +622,33 @@ impl ValidationService {
     }
 
     pub async fn validate(&self, input: &str) -> ValidationOutcome {
+        let started = Instant::now();
         let mut context = ValidationContext::new(input);
         for stage in &self.stages {
-            match stage.run(&mut context).await {
-                StageOutcome::Continue => {}
-                StageOutcome::Finish(outcome) => return outcome,
+            let stage_started = Instant::now();
+            let result = stage.run(&mut context).await;
+            let stage_ms = stage_started.elapsed().as_millis() as u64;
+            match result {
+                StageOutcome::Continue => {
+                    debug!(stage = stage.name(), stage_ms, "Stage passed");
+                }
+                StageOutcome::Finish(outcome) => {
+                    info!(
+                        stage = stage.name(),
+                        stage_ms,
+                        total_ms = started.elapsed().as_millis() as u64,
+                        status = ?outcome.status,
+                        reason_code = outcome.reason_code.as_deref().unwrap_or("-"),
+                        stage_reached = %outcome.stage_reached,
+                        mx_hosts = outcome.mx_hosts.len(),
+                        "Validation finished"
+                    );
+                    return outcome;
+                }
             }
         }
 
+        warn!("Validation pipeline ended without an outcome");
         ValidationOutcome::new(input.trim().to_string(), EmailStatus::Unknown, "pipeline")
             .with_reason(
                 "PIPELINE_INCOMPLETE",
