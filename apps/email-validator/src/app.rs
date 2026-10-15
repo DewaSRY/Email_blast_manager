@@ -7,7 +7,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
     common::{ApiResponse, AppError},
-    health, import,
+    health, import, mailer,
     validation::service::ValidationService,
     validator,
 };
@@ -16,6 +16,7 @@ use crate::{
 pub struct AppState {
     pub db: PgPool,
     pub validation_service: ValidationService,
+    pub mailer: Option<mailer::service::MailerService>,
 }
 
 impl AppState {
@@ -23,6 +24,10 @@ impl AppState {
         Ok(Self {
             db,
             validation_service: ValidationService::from_env()?,
+            mailer: mailer::service::MailerService::from_env().unwrap_or_else(|error| {
+                tracing::error!(%error, "Mailer disabled");
+                None
+            }),
         })
     }
 }
@@ -33,7 +38,8 @@ impl AppState {
         health::router::get_health,
         validator::router::validate_email,
         import::router::import_emails,
-        import::router::download_invalid
+        import::router::download_invalid,
+        mailer::router::send_email
     ),
     components(schemas(
         health::dto::HealthResponse,
@@ -42,12 +48,16 @@ impl AppState {
         ApiResponse<health::dto::HealthResponse>,
         ApiResponse<validator::dto::ValidateEmailResponse>,
         import::dto::ImportEmailResponse,
-        ApiResponse<import::dto::ImportEmailResponse>
+        ApiResponse<import::dto::ImportEmailResponse>,
+        mailer::dto::SendEmailRequest,
+        mailer::dto::SendEmailResponse,
+        ApiResponse<mailer::dto::SendEmailResponse>
     )),
     tags(
         (name = "Health", description = "Health endpoints"),
         (name = "Validator", description = "Validation endpoints"),
-        (name = "Import", description = "Import endpoints")
+        (name = "Import", description = "Import endpoints"),
+        (name = "Mailer", description = "Send mail through KumoMTA")
     )
 )]
 struct ApiDoc;
@@ -65,6 +75,7 @@ pub fn create_app(
         .nest("/health", health::router::router())
         .nest("/validator/email", validator::router::router())
         .nest("/import", import::router::router())
+        .nest("/mailer", mailer::router::router())
         .route("/import/", axum::routing::post(import::router::import_emails))
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .fallback(not_found)

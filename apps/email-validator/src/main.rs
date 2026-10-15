@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod health;
 mod import;
+mod mailer;
 mod validation;
 mod validator;
 
@@ -12,6 +13,20 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    match dotenvy::dotenv() {
+        Ok(path) => println!("Loaded .env from: {}", path.display()),
+        Err(err) => println!("Could not load .env: {}", err),
+    }
+
+    println!(
+        "SMTP_EHLO_HOST exists: {}",
+        std::env::var("SMTP_EHLO_HOST").is_ok()
+    );
+    println!(
+        "SMTP_MAIL_FROM exists: {}",
+        std::env::var("SMTP_MAIL_FROM").is_ok()
+    );
+    // dotenvy::dotenv().ok();
     let config = config::Config::from_env()?;
 
     tracing_subscriber::registry()
