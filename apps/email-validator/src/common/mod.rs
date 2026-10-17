@@ -108,6 +108,14 @@ impl AppError {
         }
     }
 
+    /// Human-readable summary including field-level reasons.
+    pub fn detail(&self) -> String {
+        match self.field_errors.first() {
+            Some(item) => format!("{}: {}", item.field, item.reason),
+            None => self.message.clone(),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn validation_error(field: impl Into<String>, reason: impl Into<String>) -> Self {
         Self {

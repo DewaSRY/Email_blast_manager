@@ -15,14 +15,19 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
+    pub imports: import::jobs::ImportQueue,
     pub validation_service: ValidationService,
     pub mailer: Option<mailer::service::MailerService>,
 }
 
 impl AppState {
-    fn new(db: PgPool) -> Result<Self, hickory_resolver::error::ResolveError> {
+    fn new(
+        db: PgPool,
+        imports: import::jobs::ImportQueue,
+    ) -> Result<Self, hickory_resolver::error::ResolveError> {
         Ok(Self {
             db,
+            imports,
             validation_service: ValidationService::from_env()?,
             mailer: mailer::service::MailerService::from_env().unwrap_or_else(|error| {
                 tracing::error!(%error, "Mailer disabled");
@@ -38,6 +43,7 @@ impl AppState {
         health::router::get_health,
         validator::router::validate_email,
         import::router::import_emails,
+        import::router::get_import_status,
         import::router::download_invalid,
         mailer::router::send_email
     ),
@@ -47,8 +53,8 @@ impl AppState {
         validator::dto::ValidateEmailResponse,
         ApiResponse<health::dto::HealthResponse>,
         ApiResponse<validator::dto::ValidateEmailResponse>,
-        import::dto::ImportEmailResponse,
-        ApiResponse<import::dto::ImportEmailResponse>,
+        import::dto::ImportStatusResponse,
+        ApiResponse<import::dto::ImportStatusResponse>,
         mailer::dto::SendEmailRequest,
         mailer::dto::SendEmailResponse,
         ApiResponse<mailer::dto::SendEmailResponse>
@@ -64,10 +70,14 @@ struct ApiDoc;
 
 pub fn create_app(
     db: PgPool,
+    imports: import::jobs::ImportQueue,
 ) -> Result<Router, hickory_resolver::error::ResolveError> {
     info!("Initializing application state");
 
-    let state = AppState::new( db)?;
+    let state = AppState::new(db, imports)?;
+    state
+        .imports
+        .spawn_workers(state.db.clone(), state.validation_service.clone());
 
     info!("Application state initialized successfully");
 

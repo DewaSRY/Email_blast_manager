@@ -1,12 +1,20 @@
-use std::io::Cursor;
+use std::{
+    fs::File,
+    io::{BufRead, BufReader, Read},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::extract::Multipart;
 use calamine::{Reader, open_workbook_auto_from_rs};
 use csv::ReaderBuilder;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 use crate::common::AppError;
 
-pub const MAX_UPLOAD_BYTES: usize = 10* 10000 * 1024 * 1024;
+pub const MAX_UPLOAD_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const EMAIL_HEADER: &str = "email";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,29 +42,41 @@ impl SheetFormat {
     }
 }
 
+/// An upload streamed to disk, so large files never sit in memory.
 #[derive(Debug)]
-pub struct UploadedFile {
+pub struct StoredUpload {
     pub filename: String,
     pub format: SheetFormat,
-    pub bytes: Vec<u8>,
+    pub path: PathBuf,
+    pub sha256: String,
 }
 
-/// Header row plus data rows (fully blank rows dropped) of an uploaded sheet.
-#[derive(Debug)]
-pub struct ParsedSheet {
+/// Header row plus a lazy iterator over data rows (fully blank rows dropped).
+pub struct RowSource {
     pub headers: Vec<String>,
     pub email_index: usize,
     /// `(1-based data row number, cells padded to the header width)`
-    pub rows: Vec<(usize, Vec<String>)>,
+    pub rows: Box<dyn Iterator<Item = Result<(usize, Vec<String>), AppError>> + Send>,
 }
 
-/// Reads the named multipart file field, enforcing the size limit while
-/// streaming, plus the non-empty and supported-extension checks.
+fn io_error(error: std::io::Error) -> AppError {
+    tracing::error!(%error, "Upload storage error");
+    AppError::new(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "Internal server error",
+    )
+}
+
+/// Streams the named multipart file field to `dir`, hashing as it goes and
+/// enforcing the size limit, plus the non-empty and supported-extension checks.
 pub async fn read_upload(
     multipart: &mut Multipart,
     field_name: &str,
     max_bytes: usize,
-) -> Result<UploadedFile, AppError> {
+    dir: &Path,
+) -> Result<StoredUpload, AppError> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     while let Some(mut field) = multipart
         .next_field()
         .await
@@ -69,46 +89,86 @@ pub async fn read_upload(
         let filename = field.file_name().unwrap_or("upload").to_string();
         let format = SheetFormat::from_filename(&filename)?;
 
-        let mut bytes = Vec::new();
-        while let Some(chunk) = field
-            .chunk()
-            .await
-            .map_err(|_| AppError::bad_request(field_name, "Could not read uploaded file"))?
-        {
-            if bytes.len() + chunk.len() > max_bytes {
-                return Err(AppError::bad_request(
-                    field_name,
-                    format!("Maximum upload size is {} MB", max_bytes / (1024 * 1024)),
-                ));
+        tokio::fs::create_dir_all(dir).await.map_err(io_error)?;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = dir.join(format!(
+            "upload-{nanos}-{}.part",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let result = stream_field(&mut field, &path, field_name, max_bytes).await;
+        let sha256 = match result {
+            Ok(hash) => hash,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(error);
             }
-            bytes.extend_from_slice(&chunk);
-        }
+        };
 
-        if bytes.is_empty() {
-            return Err(AppError::bad_request(field_name, "Uploaded file is empty"));
-        }
-
-        return Ok(UploadedFile {
+        return Ok(StoredUpload {
             filename,
             format,
-            bytes,
+            path,
+            sha256,
         });
     }
 
     Err(AppError::bad_request(field_name, "Missing file field"))
 }
 
-/// Parses the file; the sheet must contain a header named `email`.
-pub fn parse_sheet(file: &UploadedFile) -> Result<ParsedSheet, AppError> {
-    let mut records = match file.format {
-        SheetFormat::Csv => read_csv(&file.bytes)?,
-        SheetFormat::Xlsx | SheetFormat::Xls => read_workbook(&file.bytes)?,
+async fn stream_field(
+    field: &mut axum::extract::multipart::Field<'_>,
+    path: &Path,
+    field_name: &str,
+    max_bytes: usize,
+) -> Result<String, AppError> {
+    let mut file = tokio::fs::File::create(path).await.map_err(io_error)?;
+    let mut hasher = Sha256::new();
+    let mut size = 0usize;
+
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|_| AppError::bad_request(field_name, "Could not read uploaded file"))?
+    {
+        size += chunk.len();
+        if size > max_bytes {
+            return Err(AppError::bad_request(
+                field_name,
+                format!("Maximum upload size is {} MB", max_bytes / (1024 * 1024)),
+            ));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).await.map_err(io_error)?;
     }
-    .into_iter();
+    file.flush().await.map_err(io_error)?;
+
+    if size == 0 {
+        return Err(AppError::bad_request(field_name, "Uploaded file is empty"));
+    }
+
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// Opens the stored file; the sheet must contain a header named `email`.
+/// CSV rows are read lazily; Excel workbooks must be loaded whole by the parser.
+pub fn open_rows(path: &Path, format: SheetFormat) -> Result<RowSource, AppError> {
+    let mut records: Box<dyn Iterator<Item = Result<Vec<String>, AppError>> + Send> = match format
+    {
+        SheetFormat::Csv => Box::new(read_csv(path)?),
+        SheetFormat::Xlsx | SheetFormat::Xls => Box::new(read_workbook(path)?.into_iter().map(Ok)),
+    };
 
     let headers: Vec<String> = records
         .next()
-        .ok_or_else(|| AppError::bad_request("file", "File has no header row"))?
+        .ok_or_else(|| AppError::bad_request("file", "File has no header row"))??
         .into_iter()
         .map(|header| header.trim().trim_start_matches('\u{feff}').to_string())
         .collect();
@@ -116,60 +176,72 @@ pub fn parse_sheet(file: &UploadedFile) -> Result<ParsedSheet, AppError> {
     let email_index = headers
         .iter()
         .position(|header| is_email_header(header))
-        .ok_or_else(|| AppError::bad_request("file", &format!("File must have an `email` column. Found headers: {}", headers.join(",test "))))?;
+        .ok_or_else(|| {
+            AppError::bad_request(
+                "file",
+                format!(
+                    "File must have an `email` column. Found headers: {}",
+                    headers.join(", ")
+                ),
+            )
+        })?;
 
     let width = headers.len();
     let rows = records
         .enumerate()
-        .filter(|(_, row)| row.iter().any(|cell| !cell.trim().is_empty()))
-        .map(|(index, mut row)| {
-            row.resize(width, String::new());
-            (index + 1, row)
+        .filter(|(_, row)| match row {
+            Ok(row) => row.iter().any(|cell| !cell.trim().is_empty()),
+            Err(_) => true,
         })
-        .collect();
+        .map(move |(index, row)| {
+            row.map(|mut row| {
+                row.resize(width, String::new());
+                (index + 1, row)
+            })
+        });
 
-    Ok(ParsedSheet {
+    Ok(RowSource {
         headers,
         email_index,
-        rows,
+        rows: Box::new(rows),
     })
 }
 
-fn detect_delimiter(bytes: &[u8]) -> u8 {
-    let first_line = bytes
-        .split(|&b| b == b'\n')
-        .next()
-        .unwrap_or_default();
+fn detect_delimiter(path: &Path) -> Result<u8, AppError> {
+    let mut first_line = Vec::new();
+    BufReader::new(File::open(path).map_err(io_error)?)
+        .take(64 * 1024)
+        .read_until(b'\n', &mut first_line)
+        .map_err(io_error)?;
 
     let commas = first_line.iter().filter(|&&b| b == b',').count();
     let semicolons = first_line.iter().filter(|&&b| b == b';').count();
 
-    if semicolons > commas {
-        b';'
-    } else {
-        b','
-    }
+    Ok(if semicolons > commas { b';' } else { b',' })
 }
 
-fn read_csv(bytes: &[u8]) -> Result<Vec<Vec<String>>, AppError> {
-    let delimiter = detect_delimiter(bytes);
-    
-    ReaderBuilder::new()
+fn read_csv(
+    path: &Path,
+) -> Result<impl Iterator<Item = Result<Vec<String>, AppError>> + Send + use<>, AppError> {
+    let delimiter = detect_delimiter(path)?;
+    let file = File::open(path).map_err(io_error)?;
+
+    Ok(ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
         .delimiter(delimiter)
-        .from_reader(bytes)
-        .records()
+        .from_reader(BufReader::new(file))
+        .into_records()
         .map(|record| {
             record
                 .map(|record| record.iter().map(str::to_string).collect())
                 .map_err(|_| AppError::bad_request("file", "Invalid CSV row"))
-        })
-        .collect()
+        }))
 }
 
-fn read_workbook(bytes: &[u8]) -> Result<Vec<Vec<String>>, AppError> {
-    let mut workbook = open_workbook_auto_from_rs(Cursor::new(bytes))
+fn read_workbook(path: &Path) -> Result<Vec<Vec<String>>, AppError> {
+    let bytes = std::fs::read(path).map_err(io_error)?;
+    let mut workbook = open_workbook_auto_from_rs(std::io::Cursor::new(bytes))
         .map_err(|_| AppError::bad_request("file", "Invalid Excel file"))?;
     let range = workbook
         .worksheet_range_at(0)
@@ -191,58 +263,53 @@ fn is_email_header(header: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SheetFormat, UploadedFile, parse_sheet};
+    use super::{SheetFormat, open_rows};
+    use std::{path::PathBuf, sync::atomic::{AtomicU64, Ordering}};
 
-    fn csv(content: &str) -> UploadedFile {
-        UploadedFile {
-            filename: "list.csv".to_string(),
-            format: SheetFormat::Csv,
-            bytes: content.as_bytes().to_vec(),
-        }
+    fn temp_file(name: &str, content: &[u8]) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ev-test-{}-{}-{name}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, content).unwrap();
+        path
     }
 
     #[test]
     fn detects_format_from_extension_case_insensitively() {
-        assert_eq!(
-            SheetFormat::from_filename("a.CSV").unwrap(),
-            SheetFormat::Csv
-        );
-        assert_eq!(
-            SheetFormat::from_filename("a.xlsx").unwrap(),
-            SheetFormat::Xlsx
-        );
-        assert_eq!(
-            SheetFormat::from_filename("a.xls").unwrap(),
-            SheetFormat::Xls
-        );
+        assert_eq!(SheetFormat::from_filename("a.CSV").unwrap(), SheetFormat::Csv);
+        assert_eq!(SheetFormat::from_filename("a.xlsx").unwrap(), SheetFormat::Xlsx);
+        assert_eq!(SheetFormat::from_filename("a.xls").unwrap(), SheetFormat::Xls);
         assert!(SheetFormat::from_filename("csv").is_err());
         assert!(SheetFormat::from_filename("a.txt").is_err());
     }
 
     #[test]
     fn parses_rows_using_the_email_header() {
-        let sheet =
-            parse_sheet(&csv("name,Email\nA,a@example.com\n,\nC,c@example.com\nD\n")).unwrap();
+        let path = temp_file("a.csv", b"name,Email\nA,a@example.com\n,\nC,c@example.com\nD\n");
+        let source = open_rows(&path, SheetFormat::Csv).unwrap();
+        let rows: Vec<_> = source.rows.map(Result::unwrap).collect();
+        std::fs::remove_file(path).ok();
 
-        assert_eq!(sheet.email_index, 1);
-        assert_eq!(sheet.rows.len(), 3);
-        assert_eq!(sheet.rows[1].0, 3);
-        assert_eq!(sheet.rows[2].1, vec!["D".to_string(), String::new()]);
+        assert_eq!(source.email_index, 1);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].0, 3);
+        assert_eq!(rows[2].1, vec!["D".to_string(), String::new()]);
     }
 
     #[test]
     fn rejects_files_without_email_header() {
-        assert!(parse_sheet(&csv("address\na@example.com\n")).is_err());
+        let path = temp_file("b.csv", b"address\na@example.com\n");
+        assert!(open_rows(&path, SheetFormat::Csv).is_err());
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn rejects_invalid_excel_content() {
-        let file = UploadedFile {
-            filename: "a.xlsx".to_string(),
-            format: SheetFormat::Xlsx,
-            bytes: b"not a workbook".to_vec(),
-        };
-
-        assert!(parse_sheet(&file).is_err());
+        let path = temp_file("c.xlsx", b"not a workbook");
+        assert!(open_rows(&path, SheetFormat::Xlsx).is_err());
+        std::fs::remove_file(path).ok();
     }
 }

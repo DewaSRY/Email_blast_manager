@@ -184,9 +184,6 @@ impl ValidationService {
         }
     }
 
-    // pub fn system() -> Result<Self, hickory_resolver::error::ResolveError> {
-    //     Ok(Self::new(Arc::new(SystemDnsResolver::new()?)))
-    // }
 
     pub fn from_env() -> Result<Self, hickory_resolver::error::ResolveError> {
         let resolver = match std::env::var("DNS_PROVIDER").as_deref() {
@@ -194,7 +191,10 @@ impl ValidationService {
             Ok("cloudflare") => SystemDnsResolver::with_config(ResolverConfig::cloudflare()),
             _ => SystemDnsResolver::new()?, // default: system DNS
         };
-        Ok(Self::new(Arc::new(resolver)))
+        Ok(Self::new_with_prober(
+            Arc::new(resolver),
+            Arc::new(TcpSmtpProber::from_env()),
+        ))
     }
 
     pub async fn validate(&self, input: &str) -> ValidationOutcome {
