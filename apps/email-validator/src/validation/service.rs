@@ -4,7 +4,11 @@ mod smtp;
 pub use dns::{DnsLookupError, DnsResolver, DomainLookup, MxHost, SystemDnsResolver};
 pub use smtp::{SmtpProbeResult, SmtpProber, TcpSmtpProber};
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use hickory_resolver::config::ResolverConfig;
@@ -19,6 +23,7 @@ use self::smtp::smtp_recipient_probe_at;
 
 struct DomainStage {
     dns: Arc<dyn DnsResolver>,
+    smtp_timeouts: Arc<SmtpTimeoutTracker>,
 }
 
 #[async_trait]
@@ -41,6 +46,14 @@ impl Stage for DomainStage {
 
         let mut outcome =
             ValidationOutcome::new(email.value.clone(), EmailStatus::Unknown, "domain");
+
+        if self.smtp_timeouts.exceeded(&email.value, &email.domain) {
+            outcome.status = EmailStatus::Invalid;
+            return StageOutcome::Finish(outcome.with_reason(
+                "SMTP_TIMEOUT_LIMIT_EXCEEDED",
+                "SMTP probing was skipped after repeated timeouts for this email or domain",
+            ));
+        }
 
         let lookup_started = Instant::now();
         let lookup = self.dns.lookup_domain(&email.domain).await;
@@ -92,6 +105,7 @@ impl Stage for DomainStage {
 
 struct SmtpProbeStage {
     prober: Arc<dyn SmtpProber>,
+    smtp_timeouts: Arc<SmtpTimeoutTracker>,
 }
 
 #[async_trait]
@@ -146,6 +160,15 @@ impl Stage for SmtpProbeStage {
                     detail,
                 } => {
                     debug!(%domain, %mx_host, %reason_code, "Probe inconclusive, trying next host");
+                    if reason_code == "SMTP_TIMEOUT"
+                        && self.smtp_timeouts.record_timeout(&email.value, domain)
+                    {
+                        outcome.status = EmailStatus::Invalid;
+                        return StageOutcome::Finish(outcome.with_reason(
+                            "SMTP_TIMEOUT_LIMIT_EXCEEDED",
+                            "SMTP probing was stopped after more than 3 timeouts for this email or domain",
+                        ));
+                    }
                     outcome.reason_code = Some(reason_code);
                     outcome.reason_detail = Some(detail);
                 }
@@ -168,22 +191,78 @@ pub struct ValidationService {
     stages: Vec<Arc<dyn Stage>>,
 }
 
+const MAX_SMTP_TIMEOUTS: usize = 3;
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+enum TimeoutKey {
+    Domain(String),
+    Email(String),
+}
+
+#[derive(Default)]
+struct SmtpTimeoutTracker {
+    counts: Mutex<HashMap<TimeoutKey, usize>>,
+}
+
+impl SmtpTimeoutTracker {
+    fn exceeded(&self, email: &str, domain: &str) -> bool {
+        let counts = self
+            .counts
+            .lock()
+            .expect("SMTP timeout tracker lock poisoned");
+        [
+            TimeoutKey::Email(email.to_string()),
+            TimeoutKey::Domain(domain.to_string()),
+        ]
+        .iter()
+        .any(|key| {
+            counts
+                .get(key)
+                .is_some_and(|count| *count > MAX_SMTP_TIMEOUTS)
+        })
+    }
+
+    fn record_timeout(&self, email: &str, domain: &str) -> bool {
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("SMTP timeout tracker lock poisoned");
+        let email_count = counts
+            .entry(TimeoutKey::Email(email.to_string()))
+            .or_default();
+        *email_count += 1;
+        let email_exceeded = *email_count > MAX_SMTP_TIMEOUTS;
+
+        let domain_count = counts
+            .entry(TimeoutKey::Domain(domain.to_string()))
+            .or_default();
+        *domain_count += 1;
+        email_exceeded || *domain_count > MAX_SMTP_TIMEOUTS
+    }
+}
+
 impl ValidationService {
     pub fn new(dns: Arc<dyn DnsResolver>) -> Self {
         Self::new_with_prober(dns, Arc::new(TcpSmtpProber::from_env()))
     }
 
     pub fn new_with_prober(dns: Arc<dyn DnsResolver>, prober: Arc<dyn SmtpProber>) -> Self {
+        let smtp_timeouts = Arc::new(SmtpTimeoutTracker::default());
         Self {
             stages: vec![
                 Arc::new(SyntaxStage),
-                Arc::new(DomainStage { dns }),
+                Arc::new(DomainStage {
+                    dns,
+                    smtp_timeouts: Arc::clone(&smtp_timeouts),
+                }),
                 Arc::new(ClassifyStage),
-                Arc::new(SmtpProbeStage { prober }),
+                Arc::new(SmtpProbeStage {
+                    prober,
+                    smtp_timeouts,
+                }),
             ],
         }
     }
-
 
     pub fn from_env() -> Result<Self, hickory_resolver::error::ResolveError> {
         let resolver = match std::env::var("DNS_PROVIDER").as_deref() {
@@ -264,6 +343,19 @@ mod tests {
     impl SmtpProber for FakeSmtpProber {
         async fn probe(&self, _mx_host: &str, _recipient: &str) -> SmtpProbeResult {
             self.0.clone()
+        }
+    }
+
+    struct CountingTimeoutProber(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl SmtpProber for CountingTimeoutProber {
+        async fn probe(&self, _mx_host: &str, _recipient: &str) -> SmtpProbeResult {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            SmtpProbeResult::Indeterminate {
+                reason_code: "SMTP_TIMEOUT".to_string(),
+                detail: "probe timed out".to_string(),
+            }
         }
     }
 
@@ -351,6 +443,48 @@ mod tests {
             result.reason_code.as_deref(),
             Some("SMTP_TEMPORARY_FAILURE")
         );
+    }
+
+    #[tokio::test]
+    async fn marks_after_four_smtp_timeouts_and_skips_later_probes() {
+        let prober = Arc::new(CountingTimeoutProber(std::sync::atomic::AtomicUsize::new(
+            0,
+        )));
+        let service = ValidationService::new_with_prober(
+            Arc::new(FakeDns(DomainLookup::Mx(vec![MxHost {
+                preference: 10,
+                exchange: "mx.example.com".to_string(),
+            }]))),
+            prober.clone(),
+        );
+
+        for _ in 0..3 {
+            let result = service.validate("person@example.com").await;
+            assert_eq!(result.status, EmailStatus::Unknown);
+            assert_eq!(result.reason_code.as_deref(), Some("SMTP_TIMEOUT"));
+        }
+
+        let fourth = service.validate("person@example.com").await;
+        assert_eq!(fourth.status, EmailStatus::Invalid);
+        assert_eq!(
+            fourth.reason_code.as_deref(),
+            Some("SMTP_TIMEOUT_LIMIT_EXCEEDED")
+        );
+
+        let later_same_email = service.validate("person@example.com").await;
+        assert_eq!(later_same_email.status, EmailStatus::Invalid);
+        assert_eq!(
+            later_same_email.reason_code.as_deref(),
+            Some("SMTP_TIMEOUT_LIMIT_EXCEEDED")
+        );
+
+        let later_same_domain = service.validate("other@example.com").await;
+        assert_eq!(later_same_domain.status, EmailStatus::Invalid);
+        assert_eq!(
+            later_same_domain.reason_code.as_deref(),
+            Some("SMTP_TIMEOUT_LIMIT_EXCEEDED")
+        );
+        assert_eq!(prober.0.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
     #[tokio::test]

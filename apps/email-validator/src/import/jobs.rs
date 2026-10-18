@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::http::StatusCode;
@@ -10,6 +10,7 @@ use redis::{Client, aio::ConnectionManager};
 use serde_json::{Map, Value};
 use sqlx::PgPool;
 use tokio::{sync::Semaphore, task::JoinSet};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     common::{
@@ -24,10 +25,10 @@ use crate::{
 };
 
 const VALIDATION_CONCURRENCY: usize = 64;
-const CHUNK_SIZE: usize = 2_000;
+const CHUNK_SIZE: usize = 200;
 const QUEUE_KEY: &str = "import:queue";
 const PROGRESS_TTL_SECS: i64 = 24 * 60 * 60;
-const DEFAULT_WORKERS: usize = 2;
+const DEFAULT_WORKERS: usize = 8;
 
 type Row = (usize, Vec<String>);
 
@@ -427,28 +428,110 @@ async fn validate_chunk(
     chunk: &[Row],
     email_index: usize,
 ) -> Vec<Option<ValidationOutcome>> {
+    let started_at = Instant::now();
+    let chunk_size = chunk.len();
+
     let semaphore = Arc::new(Semaphore::new(VALIDATION_CONCURRENCY));
     let mut tasks = JoinSet::new();
 
+    let mut submitted = 0usize;
+    let mut skipped_empty = 0usize;
+    let mut skipped_invalid = 0usize;
+
+    info!(
+        chunk_size,
+        email_index,
+        concurrency = VALIDATION_CONCURRENCY,
+        "Email validation chunk started"
+    );
+
     for (position, (_, row)) in chunk.iter().enumerate() {
-        let email = row[email_index].trim().to_string();
+        let email = match row.get(email_index) {
+            Some(value) => value.trim().to_string(),
+            None => {
+                warn!(
+                    position,
+                    email_index, "Skipping row: email column index out of bounds"
+                );
+                skipped_invalid += 1;
+                continue;
+            }
+        };
+
         if email.is_empty() {
+            skipped_empty += 1;
+            debug!(position, "Skipping row: empty email");
             continue;
         }
+
         let service = service.clone();
-        let semaphore = semaphore.clone();
+        let semaphore = Arc::clone(&semaphore);
+
+        submitted += 1;
+
         tasks.spawn(async move {
-            let _permit = semaphore.acquire_owned().await;
-            (position, service.validate(&email).await)
+            let permit = match semaphore.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    return (position, None, Some(error.to_string()), 0u128);
+                }
+            };
+
+            let validation_started = Instant::now();
+            let outcome = service.validate(&email).await;
+            let elapsed_ms = validation_started.elapsed().as_millis();
+
+            drop(permit);
+
+            (position, Some(outcome), None, elapsed_ms)
         });
     }
 
-    let mut outcomes = vec![None; chunk.len()];
+    let mut outcomes = vec![None; chunk_size];
+    let mut completed = 0usize;
+    let mut failed_tasks = 0usize;
+
     while let Some(result) = tasks.join_next().await {
-        if let Ok((position, outcome)) = result {
-            outcomes[position] = Some(outcome);
+        match result {
+            Ok((position, Some(outcome), None, elapsed_ms)) => {
+                debug!(position, elapsed_ms, "Email validation completed");
+
+                outcomes[position] = Some(outcome);
+                completed += 1;
+            }
+            Ok((position, None, Some(detail), _)) => {
+                error!(
+                    position,
+                    %detail,
+                    "Failed to acquire validation semaphore"
+                );
+                failed_tasks += 1;
+            }
+            Ok(_) => {
+                error!("Unexpected validation task result");
+                failed_tasks += 1;
+            }
+            Err(join_error) => {
+                error!(
+                    %join_error,
+                    "Email validation task panicked or was cancelled"
+                );
+                failed_tasks += 1;
+            }
         }
     }
+
+    info!(
+        chunk_size,
+        submitted,
+        completed,
+        skipped_empty,
+        skipped_invalid,
+        failed_tasks,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "Email validation chunk finished"
+    );
+
     outcomes
 }
 
