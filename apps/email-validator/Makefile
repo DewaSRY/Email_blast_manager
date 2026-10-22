@@ -1,5 +1,5 @@
 # Local Postgres from the repo-root docker-compose.yaml (host port 5442).
-DATABASE_URL ?= postgres://user:password@localhost:5442/mydatabase
+DATABASE_URL ?= postgres://user:password@localhost:5447/mydatabase
 export DATABASE_URL
 
 .PHONY: serve

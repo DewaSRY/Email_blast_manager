@@ -23,7 +23,7 @@ impl Config {
         };
 
         let database_url = env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://user:password@localhost:5442/mydatabase".to_string());
+            .unwrap_or_else(|_| "postgres://user:password@localhost:5447/mydatabase".to_string());
 
         let redis_url =
             env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());

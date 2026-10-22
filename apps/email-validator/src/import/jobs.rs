@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -28,7 +28,9 @@ const VALIDATION_CONCURRENCY: usize = 64;
 const CHUNK_SIZE: usize = 200;
 const QUEUE_KEY: &str = "import:queue";
 const PROGRESS_TTL_SECS: i64 = 24 * 60 * 60;
-const DEFAULT_WORKERS: usize = 8;
+const DEFAULT_WORKERS: usize = 12;
+const DB_RETRIES: usize = 3;
+const VALIDATION_ATTEMPTS: usize = 3;
 
 type Row = (usize, Vec<String>);
 
@@ -105,7 +107,10 @@ pub struct ImportQueue {
 impl ImportQueue {
     pub async fn connect(redis_url: &str) -> Result<Self, redis::RedisError> {
         let client = Client::open(redis_url)?;
-        let redis = client.get_connection_manager().await?;
+        // The default 500ms response timeout is shorter than the 5s BLPOP block.
+        let config = redis::aio::ConnectionManagerConfig::new()
+            .set_response_timeout(Some(Duration::from_secs(30)));
+        let redis = client.get_connection_manager_with_config(config).await?;
         let upload_dir = std::env::var("UPLOAD_DIR").unwrap_or_else(|_| "./data/uploads".into());
         Ok(Self {
             client,
@@ -192,9 +197,11 @@ impl ImportQueue {
         let queue = self.clone();
         let recover_pool = pool.clone();
         tokio::spawn(async move {
-            // Unfinished batches are re-run from scratch; their partial rows are cleared first.
+            // Unfinished and failed batches resume; rows already stored are skipped.
             let ids: Result<Vec<i64>, _> = sqlx::query_scalar(
-                "SELECT id FROM import_batches WHERE status IN ('queued','validating') ORDER BY id",
+                "SELECT id FROM import_batches
+                 WHERE status IN ('queued','validating','failed') AND storage_path IS NOT NULL
+                 ORDER BY id",
             )
             .fetch_all(&recover_pool)
             .await;
@@ -220,7 +227,18 @@ impl ImportQueue {
     }
 
     async fn worker_loop(&self, worker: usize, pool: PgPool, validator: ValidationService) {
-        let mut conn = self.redis.clone();
+        // BLPOP blocks its connection, so each worker needs its own rather than the shared one.
+        let config = redis::aio::ConnectionManagerConfig::new()
+            .set_response_timeout(Some(Duration::from_secs(30)));
+        let mut conn = loop {
+            match self.client.get_connection_manager_with_config(config.clone()).await {
+                Ok(conn) => break conn,
+                Err(error) => {
+                    tracing::error!(%error, worker, "Worker could not connect to Redis");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+            }
+        };
         loop {
             let popped: redis::RedisResult<Option<(String, String)>> = redis::cmd("BLPOP")
                 .arg(QUEUE_KEY)
@@ -250,7 +268,6 @@ impl ImportQueue {
                 Err(error) => {
                     tracing::error!(%error, worker, "Queue pop failed");
                     tokio::time::sleep(Duration::from_secs(3)).await;
-                    break;
                 }
             }
         }
@@ -286,37 +303,62 @@ impl ImportQueue {
         validator: &ValidationService,
         batch_id: i64,
     ) -> Result<(), AppError> {
-        let (filename, storage_path): (String, Option<String>) = sqlx::query_as(
+        let claimed: Option<(String, Option<String>, i32, i32, i32)> = sqlx::query_as(
             "UPDATE import_batches
-             SET status = 'validating', started_at = now(), error_message = NULL,
-                 valid_rows = 0, invalid_rows = 0, duplicate_rows = 0
-             WHERE id = $1 AND status IN ('queued','validating')
-             RETURNING filename, storage_path",
+             SET status = 'validating', started_at = now(), finished_at = NULL, error_message = NULL
+             WHERE id = $1 AND status IN ('queued','validating','failed')
+             RETURNING filename, storage_path, valid_rows, invalid_rows, duplicate_rows",
         )
         .bind(batch_id)
         .fetch_optional(pool)
         .await
-        .map_err(db_error)?
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Import is not runnable"))?;
+        .map_err(db_error)?;
+        let Some((filename, storage_path, valid, invalid, duplicate)) = claimed else {
+            let current: Option<String> =
+                sqlx::query_scalar("SELECT status FROM import_batches WHERE id = $1")
+                    .bind(batch_id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(db_error)?;
+            return Err(AppError::new(
+                StatusCode::NOT_FOUND,
+                match current {
+                    Some(status) => format!("Import is not runnable (status: {status})"),
+                    None => "Import not found".to_string(),
+                },
+            ));
+        };
 
         let path = PathBuf::from(
             storage_path
                 .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Stored file missing"))?,
         );
+        if !path.exists() {
+            return Err(AppError::new(StatusCode::NOT_FOUND, "Stored file missing"));
+        }
         let format = SheetFormat::from_filename(&path.to_string_lossy())?;
 
-        sqlx::query("DELETE FROM contact_sources WHERE batch_id = $1")
-            .bind(batch_id)
-            .execute(pool)
-            .await
-            .map_err(db_error)?;
-        sqlx::query("DELETE FROM invalid_emails WHERE batch_id = $1")
-            .bind(batch_id)
-            .execute(pool)
-            .await
-            .map_err(db_error)?;
+        // Rows stored by an earlier run are kept and skipped.
+        let mut done_rows: HashSet<usize> = HashSet::new();
+        for sql in [
+            "SELECT row_number FROM contact_sources WHERE batch_id = $1",
+            "SELECT row_number FROM invalid_emails WHERE batch_id = $1",
+        ] {
+            let rows: Vec<i32> = sqlx::query_scalar(sql)
+                .bind(batch_id)
+                .fetch_all(pool)
+                .await
+                .map_err(db_error)?;
+            done_rows.extend(rows.into_iter().map(|r| r as usize));
+        }
 
-        let mut counters = Counters::default();
+        let mut counters = Counters {
+            total: 0,
+            valid: valid as usize,
+            invalid: invalid as usize,
+            duplicate: duplicate as usize,
+        };
+        info!(batch_id, resumed_rows = done_rows.len(), "Import rows already processed");
         self.publish(batch_id, "validating", &filename, &counters, "")
             .await;
 
@@ -354,6 +396,7 @@ impl ImportQueue {
             let mut chunk = Vec::with_capacity(CHUNK_SIZE);
             for row in rows {
                 match row {
+                    Ok(row) if done_rows.contains(&row.0) => continue,
                     Ok(row) => chunk.push(row),
                     Err(error) => {
                         let _ = sender.blocking_send(Err(error));
@@ -387,22 +430,60 @@ impl ImportQueue {
         .await
         .map_err(db_error)?;
 
+        let mut unprocessed = 0usize;
         while let Some(chunk) = receiver.recv().await {
             let chunk = chunk?;
-            let outcomes = validate_chunk(validator, &chunk, email_index).await;
-            insert_chunk(
-                pool,
-                batch_id,
-                &filename,
-                &headers,
-                email_index,
-                chunk,
-                outcomes,
-                &mut counters,
-            )
-            .await?;
+            let known = {
+                let mut attempt = 0;
+                loop {
+                    match lookup_known(pool, &chunk, email_index).await {
+                        Ok(known) => break known,
+                        Err(error) if attempt < DB_RETRIES => {
+                            attempt += 1;
+                            warn!(batch_id, attempt, detail = %error.detail(), "Known-email lookup failed; retrying");
+                            tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
+            let outcomes = validate_chunk(validator, &chunk, email_index, &known).await;
+            let mut attempt = 0;
+            loop {
+                match insert_chunk(
+                    pool,
+                    batch_id,
+                    &filename,
+                    &headers,
+                    email_index,
+                    &chunk,
+                    &outcomes,
+                    &known,
+                    &mut counters,
+                )
+                .await
+                {
+                    Ok(skipped) => {
+                        unprocessed += skipped;
+                        break;
+                    }
+                    Err(error) if attempt < DB_RETRIES => {
+                        attempt += 1;
+                        warn!(batch_id, attempt, detail = %error.detail(), "Chunk insert failed; retrying");
+                        tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             self.publish(batch_id, "validating", &filename, &counters, "")
                 .await;
+        }
+
+        if unprocessed > 0 {
+            return Err(AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{unprocessed} rows could not be validated; re-run the import to resume"),
+            ));
         }
 
         sqlx::query(
@@ -427,8 +508,47 @@ async fn validate_chunk(
     service: &ValidationService,
     chunk: &[Row],
     email_index: usize,
+    known: &[Known],
 ) -> Vec<Option<ValidationOutcome>> {
-    let started_at = Instant::now();
+    let mut outcomes = vec![None; chunk.len()];
+    for attempt in 0..VALIDATION_ATTEMPTS {
+        let skip: Vec<bool> = known
+            .iter()
+            .zip(&outcomes)
+            .map(|(k, o): (&Known, &Option<ValidationOutcome>)| {
+                !matches!(k, Known::Fresh) || o.is_some()
+            })
+            .collect();
+        let round = validate_round(service, chunk, email_index, &skip).await;
+        let mut missing = false;
+        for (position, outcome) in round.into_iter().enumerate() {
+            if outcome.is_some() {
+                outcomes[position] = outcome;
+            }
+            let has_email = chunk[position]
+                .1
+                .get(email_index)
+                .is_some_and(|e| !e.trim().is_empty());
+            if has_email && matches!(known[position], Known::Fresh) && outcomes[position].is_none()
+            {
+                missing = true;
+            }
+        }
+        if !missing {
+            break;
+        }
+        warn!(attempt, "Some validations failed; retrying them");
+    }
+    outcomes
+}
+
+async fn validate_round(
+    service: &ValidationService,
+    chunk: &[Row],
+    email_index: usize,
+    skip: &[bool],
+) -> Vec<Option<ValidationOutcome>> {
+    let started_at = Instant::now();k
     let chunk_size = chunk.len();
 
     let semaphore = Arc::new(Semaphore::new(VALIDATION_CONCURRENCY));
@@ -446,6 +566,9 @@ async fn validate_chunk(
     );
 
     for (position, (_, row)) in chunk.iter().enumerate() {
+        if skip[position] {
+            continue;
+        }
         let email = match row.get(email_index) {
             Some(value) => value.trim().to_string(),
             None => {
@@ -542,39 +665,63 @@ async fn insert_chunk(
     filename: &str,
     headers: &[String],
     email_index: usize,
-    chunk: Vec<Row>,
-    outcomes: Vec<Option<ValidationOutcome>>,
+    chunk: &[Row],
+    outcomes: &[Option<ValidationOutcome>],
+    known: &[Known],
     counters: &mut Counters,
-) -> Result<(), AppError> {
+) -> Result<usize, AppError> {
     let mut tx = pool.begin().await.map_err(db_error)?;
     let mut local = Counters::default();
+    let mut skipped = 0usize;
 
-    for ((row_number, row), outcome) in chunk.iter().zip(outcomes) {
-        let raw_email = row[email_index].trim();
+    for (((row_number, row), outcome), known) in chunk.iter().zip(outcomes).zip(known) {
+        let raw_email = row.get(email_index).map(|e| e.trim()).unwrap_or("");
+
+        match known {
+            Known::Valid => {
+                let contact_id: i64 =
+                    sqlx::query_scalar("SELECT id FROM contacts WHERE lower(email) = $1")
+                        .bind(raw_email.to_lowercase())
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(db_error)?;
+                sqlx::query(
+                    "INSERT INTO contact_sources (contact_id, batch_id, row_number)
+                     VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                )
+                .bind(contact_id)
+                .bind(batch_id)
+                .bind(*row_number as i32)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_error)?;
+                local.duplicate += 1;
+                continue;
+            }
+            Known::Invalid(reason) => {
+                insert_invalid(&mut tx, batch_id, *row_number, raw_email, headers, row, reason)
+                    .await?;
+                local.invalid += 1;
+                continue;
+            }
+            Known::Fresh => {}
+        }
+
+        if outcome.is_none() && !raw_email.is_empty() {
+            // Validation never completed; leave the row unstored so a re-run picks it up.
+            skipped += 1;
+            continue;
+        }
+
         let accepted = outcome.as_ref().filter(|o| is_importable(o));
 
         let Some(outcome) = accepted else {
             let reason = outcome
-                .and_then(|o| o.reason_detail)
+                .as_ref()
+                .and_then(|o| o.reason_detail.clone())
                 .unwrap_or_else(|| "Email is empty".to_string());
-            let raw_data: Map<String, Value> = headers
-                .iter()
-                .zip(row)
-                .map(|(header, cell)| (header.clone(), Value::String(cell.clone())))
-                .collect();
-
-            sqlx::query(
-                "INSERT INTO invalid_emails (batch_id, row_number, raw_email, raw_data, reason_detail)
-                 VALUES ($1, $2, $3, $4, $5)",
-            )
-            .bind(batch_id)
-            .bind(*row_number as i32)
-            .bind(raw_email)
-            .bind(Value::Object(raw_data))
-            .bind(reason)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_error)?;
+            insert_invalid(&mut tx, batch_id, *row_number, raw_email, headers, row, &reason)
+                .await?;
             local.invalid += 1;
             continue;
         };
@@ -609,7 +756,8 @@ async fn insert_chunk(
         .map_err(db_error)?;
 
         sqlx::query(
-            "INSERT INTO contact_sources (contact_id, batch_id, row_number) VALUES ($1, $2, $3)",
+            "INSERT INTO contact_sources (contact_id, batch_id, row_number)
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
         )
         .bind(contact_id)
         .bind(batch_id)
@@ -640,6 +788,98 @@ async fn insert_chunk(
     counters.valid += local.valid;
     counters.invalid += local.invalid;
     counters.duplicate += local.duplicate;
+    Ok(skipped)
+}
+
+/// What is already known about an email before validating it.
+enum Known {
+    Fresh,
+    Valid,
+    Invalid(String),
+}
+
+async fn lookup_known(
+    pool: &PgPool,
+    chunk: &[Row],
+    email_index: usize,
+) -> Result<Vec<Known>, AppError> {
+    let emails: Vec<String> = chunk
+        .iter()
+        .map(|(_, row)| {
+            row.get(email_index)
+                .map(|e| e.trim().to_lowercase())
+                .unwrap_or_default()
+        })
+        .filter(|e| !e.is_empty())
+        .collect();
+
+    let valid: HashSet<String> =
+        sqlx::query_scalar("SELECT lower(email) FROM contacts WHERE lower(email) = ANY($1)")
+            .bind(&emails)
+            .fetch_all(pool)
+            .await
+            .map_err(db_error)?
+            .into_iter()
+            .collect();
+    let invalid_rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT DISTINCT ON (lower(raw_email)) lower(raw_email), reason_detail
+         FROM invalid_emails WHERE lower(raw_email) = ANY($1)
+         ORDER BY lower(raw_email), id",
+    )
+    .bind(&emails)
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    let invalid: HashMap<String, String> = invalid_rows
+        .into_iter()
+        .map(|(email, reason)| (email, reason.unwrap_or_else(|| "Previously marked invalid".into())))
+        .collect();
+
+    Ok(chunk
+        .iter()
+        .map(|(_, row)| {
+            let email = row
+                .get(email_index)
+                .map(|e| e.trim().to_lowercase())
+                .unwrap_or_default();
+            if valid.contains(&email) {
+                Known::Valid
+            } else if let Some(reason) = invalid.get(&email) {
+                Known::Invalid(reason.clone())
+            } else {
+                Known::Fresh
+            }
+        })
+        .collect())
+}
+
+async fn insert_invalid(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    batch_id: i64,
+    row_number: usize,
+    raw_email: &str,
+    headers: &[String],
+    row: &[String],
+    reason: &str,
+) -> Result<(), AppError> {
+    let raw_data: Map<String, Value> = headers
+        .iter()
+        .zip(row)
+        .map(|(header, cell)| (header.clone(), Value::String(cell.clone())))
+        .collect();
+    sqlx::query(
+        "INSERT INTO invalid_emails (batch_id, row_number, raw_email, raw_data, reason_detail)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (batch_id, row_number) DO NOTHING",
+    )
+    .bind(batch_id)
+    .bind(row_number as i32)
+    .bind(raw_email)
+    .bind(Value::Object(raw_data))
+    .bind(reason)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_error)?;
     Ok(())
 }
 
@@ -661,13 +901,25 @@ async fn register(
     queue: &ImportQueue,
     upload: &StoredUpload,
 ) -> Result<ImportStatusResponse, AppError> {
-    let existing: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM import_batches WHERE file_hash = $1")
+    // let mut sha256 = upload.sha256.clone();
+    let existing: Option<(i64, String, Option<String>)> =
+        sqlx::query_as("SELECT id, status, storage_path FROM import_batches WHERE file_hash = $1")
             .bind(&upload.sha256)
             .fetch_optional(pool)
             .await
             .map_err(db_error)?;
-    if let Some(id) = existing {
+    if let Some((id, status, storage_path)) = existing {
+        if status == "failed" {
+            // Re-uploading a failed file resumes it instead of being rejected.
+            if let Some(path) = storage_path {
+                tokio::fs::rename(&upload.path, &path).await.map_err(|error| {
+                    tracing::error!(%error, "Could not store upload");
+                    AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+                })?;
+            }
+            queue.enqueue(id).await.map_err(redis_error)?;
+            return import_status(pool, queue, id).await;
+        }
         return Err(AppError::new(
             StatusCode::CONFLICT,
             format!("This file was already imported (import id {id})"),

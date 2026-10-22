@@ -1,14 +1,14 @@
 services: 
   postgress:
-    image: postgres:latest
+    image: postgres:16
     environment:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: password
       POSTGRES_DB: mydatabase
     ports:
-      - "5442:5432"
+      - "5447:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql
+      - email_blast_data:/var/lib/postgresql
 
 
 
@@ -18,4 +18,4 @@ services:
       - "6379:6379"
 
 volumes: 
-  postgres_data: 
+  email_blast_data: 
