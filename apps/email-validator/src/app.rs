@@ -45,6 +45,7 @@ impl AppState {
         import::router::import_emails,
         import::router::get_import_status,
         import::router::download_invalid,
+        import::router::download_result,
         mailer::router::send_email
     ),
     components(schemas(

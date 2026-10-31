@@ -548,7 +548,7 @@ async fn validate_round(
     email_index: usize,
     skip: &[bool],
 ) -> Vec<Option<ValidationOutcome>> {
-    let started_at = Instant::now();k
+    let started_at = Instant::now();
     let chunk_size = chunk.len();
 
     let semaphore = Arc::new(Semaphore::new(VALIDATION_CONCURRENCY));
