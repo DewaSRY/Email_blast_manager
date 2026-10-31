@@ -1,4 +1,32 @@
-services: 
+services:
+  email-validator:
+    build:
+      context: ./apps/email-validator
+    ports:
+      - "${EMAIL_VALIDATOR_PORT:-3000}:3000"
+    environment:
+      - BIND_ADDR=0.0.0.0:3000
+      - DATABASE_URL=postgres://user:password@postgress:5432/mydatabase
+      - REDIS_URL=redis://redis:6379
+      - UPLOAD_DIR=/app/data/uploads
+      - SMTP_EHLO_HOST=maleo.kencang.com
+      - SMTP_MAIL_FROM=mailer@maleo.kencang.com
+      - DNS_PROVIDER="google"
+    volumes:
+      - email_validator_uploads:/app/data/uploads
+    depends_on:
+      postgress:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
   postgress:
     image: postgres:16
     environment:
@@ -9,13 +37,22 @@ services:
       - "5447:5432"
     volumes:
       - email_blast_data:/var/lib/postgresql
-
-
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d mydatabase"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
-volumes: 
-  email_blast_data: 
+volumes:
+  email_blast_data:
+  email_validator_uploads:
